@@ -1,1 +1,118 @@
 
+# installation
+import sys, subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                       "pandas", "numpy", "scikit-learn", "matplotlib", "joblib"])
+
+# imports
+import os, re, io, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+from google.colab import files
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report, confusion_matrix
+
+# configuration
+OUT_DIR = "out_svm"
+TEST_SIZE = 0.10
+VALID_SIZE = 0.10
+ROW_CAP = 0       
+WORD_FEATS = 80000
+CHAR_FEATS = 80000
+SEED = 42
+
+# uploading
+uploaded = files.upload()
+csv_name = next(iter(uploaded))
+
+# reading
+df = pd.read_csv(io.BytesIO(uploaded[csv_name]))
+if {"text","label"} - set(df.columns):
+    raise ValueError("Expected columns: text, label")
+
+# preprocessing
+def clean_text(t):
+    if not isinstance(t, str): return ""
+    t = t.strip()
+    t = re.sub(r"http\S+|www\.\S+", " ", t)
+    t = re.sub(r"@[a-z0-9_]+", " ", t, flags=re.I)
+    t = re.sub(r"#", "", t)
+    t = re.sub(r"[^a-z0-9\s\.,!?\-']", " ", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t)
+    return t.lower().strip()
+
+def map_labels(s):
+    mapping = {-1:0, 0:1, 1:2, -1.0:0, 0.0:1, 1.0:2}
+    return s.map(mapping).astype(int)
+
+df = df[df["label"].isin([-1,0,1])].copy()
+df["text"] = df["text"].fillna("").astype(str).map(clean_text)
+df["y"] = map_labels(df["label"])
+if ROW_CAP and len(df) > ROW_CAP:
+    df, _ = train_test_split(df, train_size=ROW_CAP, stratify=df["y"], random_state=SEED)
+
+# splitting
+X, y = df["text"], df["y"]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, stratify=y, random_state=SEED)
+valid_ratio = VALID_SIZE / (1 - TEST_SIZE)
+X_train, X_valid, y_train, y_valid = train_test_split(X_train, y_train, test_size=valid_ratio, stratify=y_train, random_state=SEED)
+
+# features
+features = FeatureUnion([
+    ("word", TfidfVectorizer(analyzer="word", ngram_range=(1,2), min_df=3, max_df=0.95, max_features=WORD_FEATS)),
+    ("char", TfidfVectorizer(analyzer="char", ngram_range=(3,5), min_df=3, max_df=0.95, max_features=CHAR_FEATS)),
+])
+
+# training
+model = Pipeline([("features", features), ("clf", LinearSVC(class_weight="balanced", C=1.0, max_iter=6000, random_state=SEED))])
+model.fit(X_train, y_train)
+
+# evaluation
+def evaluate(m, X, y, name):
+    yp = m.predict(X)
+    acc = accuracy_score(y, yp)
+    macro = precision_recall_fscore_support(y, yp, average="macro", zero_division=0)
+    report = classification_report(y, yp, labels=[0,1,2], target_names=["neg","neu","pos"], zero_division=0)
+    print(f"\n[{name}] acc={acc:.4f} macro_f1={macro[2]:.4f}")
+    print(report)
+    return {"split": name, "acc": float(acc), "macro_f1": float(macro[2])}, yp
+
+m_train, _      = evaluate(model, X_train, y_train, "train")
+m_valid, _      = evaluate(model, X_valid, y_valid, "valid")
+m_test, yptest  = evaluate(model, X_test,  y_test,  "test")
+
+# saving
+os.makedirs(OUT_DIR, exist_ok=True)
+with open(os.path.join(OUT_DIR, "metrics.json"), "w", encoding="utf-8") as f:
+    json.dump({"train": m_train, "valid": m_valid, "test": m_test}, f, indent=2)
+cm = confusion_matrix(y_test, yptest, labels=[0,1,2])
+fig, ax = plt.subplots(figsize=(5,4))
+im = ax.imshow(cm, interpolation="nearest")
+ax.figure.colorbar(im, ax=ax)
+ax.set(xticks=np.arange(3), yticks=np.arange(3),
+       xticklabels=["neg","neu","pos"], yticklabels=["neg","neu","pos"],
+       ylabel="True labels", xlabel="Pred labels", title="Confusion Matrix")
+plt.setp(ax.get_xticklabels(), rotation=67, ha="right", rotation_mode="anchor")
+for i in range(3):
+    for j in range(3):
+        ax.text(j, i, f"{cm[i,j]:d}", ha="center", va="center")
+fig.tight_layout()
+fig.savefig(os.path.join(OUT_DIR, "cm_test.png"), bbox_inches="tight", dpi=150)
+plt.show(); plt.close(fig)
+joblib.dump(model, os.path.join(OUT_DIR, "model.joblib"))
+print("Saved to:", OUT_DIR)
+
+# demo
+def predict_texts(m, texts):
+    texts = [clean_text(t) for t in texts]
+    lab = {0:"neg", 1:"neu", 2:"pos"}
+    prd = m.predict(texts)
+    return [{"text": t, "label": lab[int(a)]} for t,a in zip(texts, prd)]
+
+for r in predict_texts(model, ["I love this!", "It is ok.", "This is bad."]):
+    print(r)
